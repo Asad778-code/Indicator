@@ -1,0 +1,474 @@
+//@version=6
+// ============================================================
+//  Apex Forex Academy - Smart Structure v3.6 STUDENT (rules build)
+//  v3.6: timeframe presets from the gold year-1 / year-2 test:
+//        M5  = 3-close swings, New York 12-17 UTC only, fixed 3R, extra zones
+//        M15 = 2-close swings, pause after stop-out, fixed 3R, SL +0.5 ATR, extra zones
+//        30m / 1h = v3.5 behaviour (swing-extreme target, standard zones)
+//  EVR needs volume: use a gold feed with tick volume (e.g. OANDA:XAUUSD)
+//  v3.1: one trade at a time, rejection candle, pause after a stop-out
+//  v3.2: only the nearest valid zones are drawn
+//  v3.3: student visuals - BUY/SELL + entry/SL/TP only, few settings
+//  v3.4: "Pause after a stop-out" is a setting, OFF by default
+//        (tested better on gold 30m/1h; turn ON for 5m/15m)
+//  EVR / TBR / mitigation blocks: named in the voice note but not defined
+//        in the voice note or the teacher's script; working definitions
+//  Built from the teacher's Pine script + the rules in his voice note:
+//
+//  1. STRUCTURE (no pivots, no look-ahead, no repaint)
+//     - A new high is only a confirmed Higher High once N candles
+//       CLOSE below the low of the peak candle. Candles that stay
+//       inside the peak candle's range do not count.
+//     - The lowest low of that pullback is the Higher Low.
+//     - A candle CLOSE above the confirmed HH = BOS. The HL is then
+//       locked in as the protected low.
+//     - A close below the protected low = CHoCH (trend flips).
+//     - Mirror logic for LL / LH in a downtrend.
+//
+//  2. VALID POIs (Demand/Supply, Order Block, FVG)
+//     - Only POIs formed inside the swing that produced the latest
+//       BOS (HL -> new HH) and still untouched are valid.
+//     - When price makes a new BOS without retesting them, the old
+//       POIs are deleted and the new leg's POIs take over.
+//
+//  3. SIGNAL
+//     - On the pullback after a BOS, the first touch of a valid POI
+//       (FVG at its 50% level) gives BUY / SELL on candle close.
+//     - Each POI fires once. A close through a POI kills it.
+//
+//  Educational charting tool. Not financial advice.
+// ============================================================
+indicator("Apex Forex Academy - Smart Structure (Student)", shorttitle = "Apex SMC", overlay = true, max_labels_count = 500, max_bars_back = 100)
+
+// --------------------------- INPUTS ---------------------------
+const string G_ST = "Market Structure"
+
+const string G_POI = "Points of Interest"
+bool  useDZ      = true
+bool  useOB      = true
+bool  useFVG     = true
+bool  fvgCE      = true
+float fvgMinAtr  = 0.10
+float impMult    = 1.5
+int   maxBase    = 3
+int   obSearch   = 5
+
+const string G_EN = "Entry Filters (optional, off by default)"
+bool  oneTrade  = true
+bool  useRSI     = false
+int   rsiLen     = 14
+float buyRSI     = 50
+float sellRSI    = 50
+
+const string G_RK = "Risk / Targets"
+float pipIn      = 0.0
+
+// --------------------------- PRESET ---------------------------
+const string G_PR = "Timeframe preset"
+string preset = input.string("Auto", "Preset", options = ["Auto", "M5", "M15", "30m / 1h"], group = G_PR, tooltip = "Auto picks from the chart timeframe. M5 = New York session only (12-17 UTC), fixed 3R. M15 = all day, fixed 3R, stop +0.5 ATR, pause after a stop-out. 30m / 1h = swing-extreme target. Tested on 2 years of gold (XAUUSD); other markets untested.", display = display.none)
+int    tfSecs = timeframe.in_seconds()
+string tfp    = preset != "Auto" ? preset : tfSecs <= 300 ? "M5" : tfSecs <= 900 ? "M15" : "30m / 1h"
+int    pbCloses   = tfp == "M5" ? 3 : 2
+bool   lossLock   = tfp == "M15"
+bool   needRej    = true
+float  slPips     = 5.0
+float  slAtr      = tfp == "M15" ? 0.5 : 0.0
+string tpMode     = tfp == "30m / 1h" ? "Leg extreme" : "Fixed R:R"
+float  rrIn       = tfp == "30m / 1h" ? 2.0 : 3.0
+bool   useSess    = tfp == "M5"
+int    sessStart  = 12
+int    sessEnd    = 17
+bool   useEVR     = tfp != "30m / 1h"
+bool   useTBR     = tfp != "30m / 1h"
+bool   useMB      = tfp != "30m / 1h"
+float  evrVolMult = 2.0
+
+// --------------------------- COLOURS ---------------------------
+color C_BULL  = #089981
+color C_BEAR  = #F23645
+
+// --------------------------- SERIES ---------------------------
+float atr     = ta.atr(14)
+float avgBody = ta.sma(math.abs(close - open), 20)
+float avgVol  = ta.sma(volume, 20)
+float rsi     = ta.rsi(close, rsiLen)
+float pip     = pipIn > 0 ? pipIn : syminfo.mintick * (syminfo.type == "forex" ? 10 : 1)
+
+// --------------------------- POI TYPE ---------------------------
+// kind: 0 = demand/supply, 1 = order block, 2 = FVG, 3 = EVR, 4 = TBR, 5 = mitigation ; dir: 1 bull, -1 bear
+type POI
+    int   kind
+    int   dir
+    float top
+    float bottom
+    int   left
+    int   born
+    bool  touched = false
+
+method entryLevel(POI p) =>
+    float mid = (p.top + p.bottom) / 2
+    p.kind == 2 and fvgCE ? mid : p.dir == 1 ? p.top : p.bottom
+
+addPOI(array<POI> arr, int kind, int dir, float top, float bot, int left) =>
+    arr.push(POI.new(kind, dir, top, bot, left, bar_index))
+    if arr.size() > 80
+        arr.shift()
+
+// a pending POI is spent once price comes back to its entry level
+markTouched(array<POI> arr) =>
+    for p in arr
+        if not p.touched and bar_index > p.born
+            float lvl = p.entryLevel()
+            bool hit = p.dir == 1 ? low <= lvl : high >= lvl
+            if hit
+                p.touched := true
+
+// remove every POI of the old leg (traded ones stay grey as history)
+clearList(array<POI> arr) =>
+    arr.clear()
+
+// new BOS/CHoCH: old POIs die, untouched POIs inside the new swing become valid
+promote(array<POI> pend, array<POI> act, float legExt, int dir) =>
+    clearList(act)
+    for p in pend
+        bool inside = dir == 1 ? p.bottom >= legExt : p.top <= legExt
+        if not p.touched and inside
+            act.push(p)
+    pend.clear()
+
+// --------------------------- STATE ---------------------------
+var int   trend = 0
+// up-leg: peak candidate, pullback, protected low
+var float pkHi   = na
+var float pkLo   = na
+var int   pkBar  = na
+var int   pkCnt  = 0
+var bool  pbOn   = false
+var float pbLo   = na
+var int   pbLoBar = na
+var float protLo = na
+var int   protLoBar = na
+var float legTop = na
+var int   legTopBar = na
+// down-leg: trough candidate, rally, protected high
+var float trLo   = na
+var float trHi   = na
+var int   trBar  = na
+var int   trCnt  = 0
+var bool  rlOn   = false
+var float rlHi   = na
+var int   rlHiBar = na
+var float protHi = na
+var int   protHiBar = na
+var float legBot = na
+var int   legBotBar = na
+
+var array<POI> pendBull = array.new<POI>()
+var array<POI> pendBear = array.new<POI>()
+var array<POI> actBull  = array.new<POI>()
+var array<POI> actBear  = array.new<POI>()
+var int lastBullOB = na
+var int lastBearOB = na
+var bool lockBuy  = false
+var bool lockSell = false
+
+var int   tDir   = 0
+var int   tBar   = na
+var float tEntry = na
+var float tSL    = na
+var float tTP    = na
+
+bool bullBOS = false
+bool bearBOS = false
+bool bullCH  = false
+bool bearCH  = false
+bool buySig  = false
+bool sellSig = false
+float buyBot  = na
+float sellTop = na
+
+int  utcHour = hour(time, "UTC")
+bool inSess   = not useSess or (utcHour >= sessStart and utcHour < sessEnd)
+
+// everything runs on CLOSED candles only -> nothing repaints
+if barstate.isconfirmed
+    // -- init --
+    if trend == 0
+        trend     := 1
+        pkHi      := high
+        pkLo      := low
+        pkBar     := bar_index
+        legTop    := high
+        legTopBar := bar_index
+        protLo    := low
+        protLoBar := bar_index
+
+    // -- 1. spend pending POIs that price has already revisited --
+    markTouched(pendBull)
+    markTouched(pendBear)
+
+    // -- 2. detect new POIs (they wait in "pending" until a BOS) --
+    bool bullGap = low > high[2] and (low - high[2]) >= fvgMinAtr * atr
+    bool bearGap = high < low[2] and (low[2] - high) >= fvgMinAtr * atr
+
+    if useFVG and bullGap
+        addPOI(pendBull, 2, 1, low, high[2], bar_index - 1)
+    if useFVG and bearGap
+        addPOI(pendBear, 2, -1, low[2], high, bar_index - 1)
+
+    // Order Block = last opposite candle before the move that left the FVG
+    if useOB and bullGap
+        for i = 2 to obSearch + 1
+            if close[i] < open[i]
+                int b = bar_index - i
+                if close > high[i] and (na(lastBullOB) or b > lastBullOB)
+                    addPOI(pendBull, 1, 1, high[i], low[i], b)
+                    lastBullOB := b
+                break
+    if useOB and bearGap
+        for i = 2 to obSearch + 1
+            if close[i] > open[i]
+                int b = bar_index - i
+                if close < low[i] and (na(lastBearOB) or b > lastBearOB)
+                    addPOI(pendBear, 1, -1, high[i], low[i], b)
+                    lastBearOB := b
+                break
+
+    // Demand = 1..N red candles, then a strong green candle closing above them
+    bool impBull = close > open and (close - open) >= impMult * avgBody
+    bool impBear = close < open and (open - close) >= impMult * avgBody
+    if useDZ and impBull
+        int   k  = 0
+        float zt = na
+        float zb = na
+        for i = 1 to maxBase
+            if close[i] < open[i]
+                k  := i
+                zt := na(zt) ? high[i] : math.max(zt, high[i])
+                zb := na(zb) ? low[i] : math.min(zb, low[i])
+            else
+                break
+        if k > 0 and close > zt
+            addPOI(pendBull, 0, 1, zt, zb, bar_index - k)
+    if useDZ and impBear
+        int   kS  = 0
+        float st = na
+        float sb = na
+        for i = 1 to maxBase
+            if close[i] > open[i]
+                kS  := i
+                st := na(st) ? high[i] : math.max(st, high[i])
+                sb := na(sb) ? low[i] : math.min(sb, low[i])
+            else
+                break
+        if kS > 0 and close < sb
+            addPOI(pendBear, 0, -1, st, sb, bar_index - kS)
+
+    // EVR = volume-climax impulse candle (needs real / tick volume; does nothing without volume)
+    bool volOk = avgVol > 0 and volume >= evrVolMult * avgVol
+    if useEVR and volOk and impBull
+        addPOI(pendBull, 3, 1, high, low, bar_index)
+    if useEVR and volOk and impBear
+        addPOI(pendBear, 3, -1, high, low, bar_index)
+
+    // TBR = rejection candle (long wick, close back in direction)
+    float tbrBody = math.abs(close - open)
+    bool bullRej = (high - low) > 0 and (math.min(open, close) - low) >= 2 * tbrBody and close > open
+    bool bearRej = (high - low) > 0 and (high - math.max(open, close)) >= 2 * tbrBody and close < open
+    if useTBR and bullRej
+        addPOI(pendBull, 4, 1, math.max(open, close), low, bar_index)
+    if useTBR and bearRej
+        addPOI(pendBear, 4, -1, high, math.min(open, close), bar_index)
+
+    // Mitigation block = last opposite candle before a displacement break without an FVG
+    if useMB and impBull and close > high[1] and not bullGap
+        for i = 1 to obSearch + 1
+            if close[i] < open[i]
+                addPOI(pendBull, 5, 1, high[i], low[i], bar_index - i)
+                break
+    if useMB and impBear and close < low[1] and not bearGap
+        for i = 1 to obSearch + 1
+            if close[i] > open[i]
+                addPOI(pendBear, 5, -1, high[i], low[i], bar_index - i)
+                break
+
+    // -- 3. retest of a valid POI -> signal --
+    if trend == 1 and actBull.size() > 0
+        bool okB    = (not useRSI or rsi >= buyRSI) and (not needRej or close > open)
+        bool allowB = not (oneTrade and tDir != 0) and not lockBuy and inSess
+        for i = actBull.size() - 1 to 0
+            POI p = actBull.get(i)
+            if p.touched
+                continue
+            if close < p.bottom
+                actBull.remove(i)
+            else if low <= p.entryLevel() and not allowB
+                p.touched := true
+            else if low <= p.entryLevel() and okB
+                p.touched := true
+                buyBot    := na(buyBot) ? p.bottom : math.min(buyBot, p.bottom)
+        buySig := not na(buyBot)
+
+    if trend == -1 and actBear.size() > 0
+        bool okS    = (not useRSI or rsi <= sellRSI) and (not needRej or close < open)
+        bool allowS = not (oneTrade and tDir != 0) and not lockSell and inSess
+        for i = actBear.size() - 1 to 0
+            POI p = actBear.get(i)
+            if p.touched
+                continue
+            if close > p.top
+                actBear.remove(i)
+            else if high >= p.entryLevel() and not allowS
+                p.touched := true
+            else if high >= p.entryLevel() and okS
+                p.touched := true
+                sellTop   := na(sellTop) ? p.top : math.max(sellTop, p.top)
+        sellSig := not na(sellTop)
+
+    // -- 4. market structure --
+    if trend == 1
+        if close < protLo
+            // CHoCH down: the higher low failed
+            bearCH := true
+            lockSell := false
+            trend     := -1
+            protHi    := legTop
+            protHiBar := legTopBar
+            clearList(actBull)
+            promote(pendBear, actBear, legTop, -1)
+            trLo      := low
+            trHi      := high
+            trBar     := bar_index
+            trCnt     := 0
+            rlOn      := false
+            rlHi      := na
+            rlHiBar   := na
+            legBot    := low
+            legBotBar := bar_index
+        else if pbOn and close > pkHi
+            // BOS up: candle closed above the confirmed HH
+            bullBOS := true
+            lockBuy := false
+            protLo    := pbLo
+            protLoBar := pbLoBar
+            promote(pendBull, actBull, pbLo, 1)
+            pkHi      := high
+            pkLo      := low
+            pkBar     := bar_index
+            pkCnt     := 0
+            pbOn      := false
+            pbLo      := na
+            pbLoBar   := na
+            legTop    := high
+            legTopBar := bar_index
+        else
+            if high > legTop
+                legTop    := high
+                legTopBar := bar_index
+            if not pbOn and high > pkHi
+                // new peak candidate (inside candles never get here)
+                pkHi    := high
+                pkLo    := low
+                pkBar   := bar_index
+                pkCnt   := 0
+                pbLo    := na
+                pbLoBar := na
+            else
+                if na(pbLo) or low < pbLo
+                    pbLo    := low
+                    pbLoBar := bar_index
+                if not pbOn and close < pkLo
+                    pkCnt += 1
+                    if pkCnt >= pbCloses
+                        pbOn := true
+    else if trend == -1
+        if close > protHi
+            // CHoCH up: the lower high failed
+            bullCH := true
+            lockBuy := false
+            trend     := 1
+            protLo    := legBot
+            protLoBar := legBotBar
+            clearList(actBear)
+            promote(pendBull, actBull, legBot, 1)
+            pkHi      := high
+            pkLo      := low
+            pkBar     := bar_index
+            pkCnt     := 0
+            pbOn      := false
+            pbLo      := na
+            pbLoBar   := na
+            legTop    := high
+            legTopBar := bar_index
+        else if rlOn and close < trLo
+            // BOS down: candle closed below the confirmed LL
+            bearBOS := true
+            lockSell := false
+            protHi    := rlHi
+            protHiBar := rlHiBar
+            promote(pendBear, actBear, rlHi, -1)
+            trLo      := low
+            trHi      := high
+            trBar     := bar_index
+            trCnt     := 0
+            rlOn      := false
+            rlHi      := na
+            rlHiBar   := na
+            legBot    := low
+            legBotBar := bar_index
+        else
+            if low < legBot
+                legBot    := low
+                legBotBar := bar_index
+            if not rlOn and low < trLo
+                trLo    := low
+                trHi    := high
+                trBar   := bar_index
+                trCnt   := 0
+                rlHi    := na
+                rlHiBar := na
+            else
+                if na(rlHi) or high > rlHi
+                    rlHi    := high
+                    rlHiBar := bar_index
+                if not rlOn and close > trHi
+                    trCnt += 1
+                    if trCnt >= pbCloses
+                        rlOn := true
+
+    // -- 5. trade result of the previous signal --
+    if tDir != 0 and bar_index > tBar
+        bool hitSL = tDir == 1 ? low <= tSL : high >= tSL
+        bool hitTP = tDir == 1 ? high >= tTP : low <= tTP
+        if hitSL or hitTP
+            if hitSL and lossLock
+                if tDir == 1
+                    lockBuy := true
+                else
+                    lockSell := true
+            tDir := 0
+
+    // -- 6. new signal: label + entry / SL / TP --
+    if buySig or sellSig
+        int   d    = buySig ? 1 : -1
+        float sl   = d == 1 ? buyBot - slPips * pip - slAtr * atr : sellTop + slPips * pip + slAtr * atr
+        float risk = math.abs(close - sl)
+        float ext  = d == 1 ? legTop : legBot
+        bool  extOk = tpMode == "Leg extreme" and (d == 1 ? ext > close : ext < close)
+        tDir   := d
+        tBar   := bar_index
+        tEntry := close
+        tSL    := sl
+        tTP    := extOk ? ext : close + d * rrIn * risk
+        if d == 1
+            label.new(bar_index, low, "BUY", style = label.style_label_up, color = C_BULL, textcolor = color.white, size = size.small)
+        else
+            label.new(bar_index, high, "SELL", style = label.style_label_down, color = C_BEAR, textcolor = color.white, size = size.small)
+        string msg = (d == 1 ? "BUY " : "SELL ") + syminfo.ticker + " " + timeframe.period + " entry=" + str.tostring(tEntry, format.mintick) + " sl=" + str.tostring(tSL, format.mintick) + " tp=" + str.tostring(tTP, format.mintick)
+        alert(msg, alert.freq_once_per_bar_close)
+
+// --------------------------- ALERTS ---------------------------
+alertcondition(buySig, "BUY signal", "Apex SMC: BUY {{ticker}} {{interval}} @ {{close}}")
+alertcondition(sellSig, "SELL signal", "Apex SMC: SELL {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bullBOS or bullCH, "Bullish BOS / CHoCH", "Apex SMC: bullish structure break {{ticker}} {{interval}}")
+alertcondition(bearBOS or bearCH, "Bearish BOS / CHoCH", "Apex SMC: bearish structure break {{ticker}} {{interval}}")
